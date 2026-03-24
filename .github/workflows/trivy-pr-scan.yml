@@ -1,0 +1,548 @@
+name: Trivy Security Scan
+
+on:
+  pull_request:   # triggers on ANY PR, regardless of source or target branch
+
+permissions:
+  contents: write          # needed to push fix branches
+  pull-requests: write     # needed to post PR comments and create fix PRs
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════
+  #  Job 1: Run all security scans and post a sticky PR comment
+  # ════════════════════════════════════════════════════════════════════════
+  trivy-scan:
+    name: Security Scan
+    runs-on: ubuntu-24.04
+    outputs:
+      has_fixable_vulns: ${{ steps.check_fixable.outputs.has_fixable_vulns }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Scan 1: Dependency vulnerabilities (table for comment) ────────
+      - name: Scan for vulnerabilities (table)
+        id: vuln_scan
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          format: table
+          output: trivy-vuln.txt
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 0
+
+      # ── Scan 1b: Dependency vulnerabilities (JSON for auto-fix) ───────
+      - name: Scan for vulnerabilities (JSON)
+        if: always()
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          format: json
+          output: trivy-vuln.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 0
+
+      # ── Scan 2: Secret scanning (table for detection) ────────────────
+      - name: Scan for secrets (table)
+        id: secret_scan
+        if: always()
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          format: table
+          output: trivy-secrets.txt
+          exit-code: 0
+
+      # ── Scan 2b: Secret scanning (JSON for comment) ──────────────────
+      - name: Scan for secrets (JSON)
+        if: always()
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          format: json
+          output: trivy-secrets.json
+          exit-code: 0
+
+      # ── Scan 3: IaC misconfigurations (table for detection) ──────────
+      - name: Scan for IaC misconfigurations (table)
+        id: misconfig_scan
+        if: always()
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          output: trivy-misconfig.txt
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+      # ── Scan 3b: IaC misconfigurations (JSON for comment) ────────────
+      - name: Scan for IaC misconfigurations (JSON)
+        if: always()
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: json
+          output: trivy-misconfig.json
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+      # ── Scan 4: License scanning ────────────────────────────────────
+      - name: Scan for licenses
+        id: license_scan
+        if: always()
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: license
+          format: json
+          output: trivy-licenses.json
+          exit-code: 0
+
+      # ── Check for copyleft licenses ──────────────────────────────────
+      - name: Check for copyleft licenses
+        if: always()
+        id: license_check
+        run: |
+          COPYLEFT_PATTERNS='GPL-2.0|GPL-3.0|AGPL-3.0|SSPL-1.0|EUPL-1.1|EUPL-1.2'
+
+          # Extract all license findings and filter for copyleft
+          jq -r '
+            [.Results[]? |
+             select(.Licenses != null) |
+             .Licenses[] |
+             select(.Name != null)] |
+             unique_by(.PkgName + .Name) |
+             .[] |
+             "\(.PkgName // "unknown")\t\(.Name)\t\(.Severity // "UNKNOWN")"
+          ' trivy-licenses.json 2>/dev/null > all-licenses.txt || true
+
+          # Filter copyleft licenses
+          grep -iE "$COPYLEFT_PATTERNS" all-licenses.txt > copyleft-licenses.txt 2>/dev/null || true
+
+          if [ -s copyleft-licenses.txt ]; then
+            echo "has_copyleft=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_copyleft=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Check for fixable vulnerabilities ────────────────────────────
+      - name: Check for fixable vulnerabilities
+        if: always()
+        id: check_fixable
+        run: |
+          FIXABLE=$(jq '[
+            .Results[]? |
+            select(.Vulnerabilities != null) |
+            .Vulnerabilities[] |
+            select(.FixedVersion != null and .FixedVersion != "")
+          ] | length' trivy-vuln.json 2>/dev/null || echo "0")
+
+          if [ "$FIXABLE" -gt 0 ]; then
+            echo "has_fixable_vulns=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_fixable_vulns=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Upload JSON artifacts for the auto-fix job ───────────────────
+      - name: Upload vulnerability JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-vuln-json
+          path: trivy-vuln.json
+          retention-days: 1
+
+      # ── Build the sticky PR comment ──────────────────────────────────
+      - name: Build PR comment
+        if: always()
+        id: build_comment
+        run: |
+          HAS_VULNS=false
+          HAS_SECRETS=false
+          HAS_MISCONFIG=false
+          HAS_COPYLEFT="${{ steps.license_check.outputs.has_copyleft }}"
+          HAS_FIXABLE="${{ steps.check_fixable.outputs.has_fixable_vulns }}"
+
+          # Use JSON to reliably detect actual findings (table files contain headers even when empty)
+          VULN_COUNT=$(jq '[.Results[]? | select(.Vulnerabilities != null) | .Vulnerabilities[] | select(.FixedVersion != null and .FixedVersion != "")] | length' trivy-vuln.json 2>/dev/null || echo "0")
+          SECRET_COUNT=$(jq '[.Results[]? | select(.Secrets != null) | .Secrets[]] | length' trivy-secrets.json 2>/dev/null || echo "0")
+          MISCONFIG_COUNT=$(jq '[.Results[]? | select(.Misconfigurations != null) | .Misconfigurations[]] | length' trivy-misconfig.json 2>/dev/null || echo "0")
+
+          [ "$VULN_COUNT" -gt 0 ] && HAS_VULNS=true
+          [ "$SECRET_COUNT" -gt 0 ] && HAS_SECRETS=true
+          [ "$MISCONFIG_COUNT" -gt 0 ] && HAS_MISCONFIG=true
+
+          {
+            echo "## 🔒 Security Scan Results"
+            echo ""
+            echo "Scan for commit \`${GITHUB_SHA::7}\` on **${{ github.head_ref }}**"
+            echo ""
+
+            # ── Summary table ──
+            echo "| Check | Status |"
+            echo "|-------|--------|"
+
+            if [ "$HAS_VULNS" = "true" ]; then
+              echo "| 📦 Dependency Vulnerabilities | ❌ Found |"
+            else
+              echo "| 📦 Dependency Vulnerabilities | ✅ Clean |"
+            fi
+
+            if [ "$HAS_SECRETS" = "true" ]; then
+              echo "| 🔑 Secrets | ❌ Found |"
+            else
+              echo "| 🔑 Secrets | ✅ Clean |"
+            fi
+
+            if [ "$HAS_MISCONFIG" = "true" ]; then
+              echo "| 🏗️ IaC Misconfigurations | ❌ Found |"
+            else
+              echo "| 🏗️ IaC Misconfigurations | ✅ Clean |"
+            fi
+
+            if [ "$HAS_COPYLEFT" = "true" ]; then
+              echo "| 📜 Copyleft Licenses | ⚠️ Found |"
+            else
+              echo "| 📜 Copyleft Licenses | ✅ Clean |"
+            fi
+
+            echo ""
+
+            # ── Vulnerabilities detail ──
+            echo "### 📦 Dependency Vulnerabilities"
+            if [ "$HAS_VULNS" = "true" ]; then
+              echo ""
+              echo "> Showing **CRITICAL** and **HIGH** severity vulnerabilities with available fixes."
+              if [ "$HAS_FIXABLE" = "true" ]; then
+                echo ""
+                echo "> 🤖 **Auto-fix PRs** are being created for vulnerabilities with known fixes. Check the linked PRs below once the workflow completes."
+              fi
+              echo ""
+              echo '<details><summary>Click to expand</summary>'
+              echo ""
+              echo "| Severity | Package | Installed | Fixed | CVE |"
+              echo "|----------|---------|-----------|-------|-----|"
+              jq -r '
+                [.Results[]? |
+                 select(.Vulnerabilities != null) |
+                 .Vulnerabilities[] |
+                 select(.FixedVersion != null and .FixedVersion != "")] |
+                sort_by(.Severity) |
+                reverse |
+                .[] |
+                "| \(if .Severity == "CRITICAL" then "🔴 CRITICAL" elif .Severity == "HIGH" then "🟠 HIGH" else .Severity end) | `\(.PkgName)` | `\(.InstalledVersion)` | `\(.FixedVersion)` | [\(.VulnerabilityID)](https://nvd.nist.gov/vuln/detail/\(.VulnerabilityID)) |"
+              ' trivy-vuln.json 2>/dev/null || echo "| ⚠️ | Could not parse results | - | - | - |"
+              echo ""
+              echo '</details>'
+            else
+              echo ""
+              echo "No fixable vulnerabilities found — you're all good! 🎉"
+            fi
+            echo ""
+
+            # ── Secrets detail ──
+            echo "### 🔑 Secrets"
+            if [ "$HAS_SECRETS" = "true" ]; then
+              echo ""
+              echo "> ⚠️ **Action required:** Leaked secrets must be rotated immediately, even if the commit is reverted."
+              echo ""
+              echo '<details><summary>Click to expand</summary>'
+              echo ""
+              echo "| Severity | Rule | File | Line |"
+              echo "|----------|------|------|------|"
+              jq -r '
+                [.Results[]? |
+                 select(.Secrets != null) |
+                 .Target as $target |
+                 .Secrets[] |
+                 {severity: .Severity, rule: .RuleID, title: .Title, target: $target, start: .StartLine, end: .EndLine}] |
+                sort_by(.Severity) |
+                reverse |
+                .[] |
+                "| \(if .severity == "CRITICAL" then "🔴 CRITICAL" elif .severity == "HIGH" then "🟠 HIGH" elif .severity == "MEDIUM" then "🟡 MEDIUM" else .severity end) | \(.title // .rule) | `\(.target)` | L\(.start)\(if .end != .start then "-L\(.end)" else "" end) |"
+              ' trivy-secrets.json 2>/dev/null || echo "| ⚠️ | Could not parse results | - | - |"
+              echo ""
+              echo '</details>'
+            else
+              echo ""
+              echo "No secrets detected — nice work! 🎉"
+            fi
+            echo ""
+
+            # ── IaC misconfigurations detail ──
+            echo "### 🏗️ IaC Misconfigurations"
+            if [ "$HAS_MISCONFIG" = "true" ]; then
+              echo ""
+              echo "> Review the Dockerfile / infrastructure configuration issues below."
+              echo ""
+              echo '<details><summary>Click to expand</summary>'
+              echo ""
+              echo "| Severity | Check | File | Description |"
+              echo "|----------|-------|------|-------------|"
+              jq -r '
+                [.Results[]? |
+                 select(.Misconfigurations != null) |
+                 .Target as $target |
+                 .Misconfigurations[] |
+                 {severity: .Severity, id: .ID, title: .Title, target: $target, message: .Message, resolution: .Resolution}] |
+                sort_by(.Severity) |
+                reverse |
+                .[] |
+                "| \(if .severity == "CRITICAL" then "🔴 CRITICAL" elif .severity == "HIGH" then "🟠 HIGH" elif .severity == "MEDIUM" then "🟡 MEDIUM" else .severity end) | [\(.id)](https://avd.aquasec.com/misconfig/\(.id | ascii_downcase)) | `\(.target)` | \(.message // .title) |"
+              ' trivy-misconfig.json 2>/dev/null || echo "| ⚠️ | Could not parse results | - | - |"
+              echo ""
+              echo '</details>'
+            else
+              echo ""
+              echo "No IaC misconfigurations found — looking great! 🎉"
+            fi
+            echo ""
+
+            # ── License detail ──
+            echo "### 📜 License Compliance"
+            if [ "$HAS_COPYLEFT" = "true" ]; then
+              echo ""
+              echo "> ⚠️ The following dependencies use **copyleft licenses** (GPL, AGPL, SSPL, EUPL)."
+              echo "> These licenses may require your project to be open-sourced. Please review with your legal team."
+              echo ""
+              echo "| Package | License | Severity |"
+              echo "|---------|---------|----------|"
+              while IFS=$'\t' read -r pkg license severity; do
+                echo "| \`$pkg\` | $license | $severity |"
+              done < copyleft-licenses.txt
+            else
+              echo ""
+              echo "No copyleft license issues found — all clear! 🎉"
+            fi
+
+            echo ""
+            echo "---"
+            echo "*🤖 Powered by [Trivy](https://trivy.dev) · scan ran at $(date -u '+%Y-%m-%d %H:%M UTC')*"
+
+          } > pr-comment.md
+
+      # ── Post (or update) the sticky comment on the PR ────────────────
+      - name: Post sticky PR comment
+        if: always()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          hide_and_recreate: true
+          hide_classify: "OUTDATED"
+          path: pr-comment.md
+
+      # ── Fail the job if any scan found issues ────────────────────────
+      - name: Fail if issues found
+        if: always()
+        run: |
+          FAIL=0
+
+          VULN_COUNT=$(jq '[.Results[]? | select(.Vulnerabilities != null) | .Vulnerabilities[] | select(.FixedVersion != null and .FixedVersion != "")] | length' trivy-vuln.json 2>/dev/null || echo "0")
+          SECRET_COUNT=$(jq '[.Results[]? | select(.Secrets != null) | .Secrets[]] | length' trivy-secrets.json 2>/dev/null || echo "0")
+          MISCONFIG_COUNT=$(jq '[.Results[]? | select(.Misconfigurations != null) | .Misconfigurations[]] | length' trivy-misconfig.json 2>/dev/null || echo "0")
+
+          if [ "$VULN_COUNT" -gt 0 ]; then
+            echo "❌ $VULN_COUNT dependency vulnerabilities detected!"
+            FAIL=1
+          fi
+          if [ "$SECRET_COUNT" -gt 0 ]; then
+            echo "❌ $SECRET_COUNT secrets detected!"
+            FAIL=1
+          fi
+          if [ "$MISCONFIG_COUNT" -gt 0 ]; then
+            echo "❌ $MISCONFIG_COUNT IaC misconfigurations detected!"
+            FAIL=1
+          fi
+          if [ "${{ steps.license_check.outputs.has_copyleft }}" = "true" ]; then
+            echo "⚠️ Copyleft licenses detected!"
+            FAIL=1
+          fi
+          if [ "$FAIL" -eq 1 ]; then
+            echo "See the PR comment above for full details."
+            exit 1
+          fi
+          echo "✅ All scans passed!"
+
+  # ════════════════════════════════════════════════════════════════════════
+  #  Job 2: Create auto-fix PRs for vulnerable dependencies
+  # ════════════════════════════════════════════════════════════════════════
+  auto-fix-prs:
+    name: Create Fix PRs
+    runs-on: ubuntu-24.04
+    needs: trivy-scan
+    if: always() && needs.trivy-scan.outputs.has_fixable_vulns == 'true'
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Download vulnerability JSON
+        uses: actions/download-artifact@v4
+        with:
+          name: trivy-vuln-json
+
+      - name: Create fix PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          PR_BRANCH="${{ github.head_ref }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Extract unique (package, fixed_version) pairs with their CVEs
+          # Output: one JSON object per unique package to fix
+          jq -c '
+            [
+              .Results[]? |
+              select(.Vulnerabilities != null) |
+              .Vulnerabilities[] |
+              select(.FixedVersion != null and .FixedVersion != "") |
+              {
+                pkg: .PkgName,
+                installed: .InstalledVersion,
+                fixed: .FixedVersion,
+                cve: .VulnerabilityID,
+                severity: .Severity,
+                title: .Title
+              }
+            ] |
+            group_by(.pkg) |
+            map({
+              pkg: .[0].pkg,
+              installed: .[0].installed,
+              fixed: .[0].fixed,
+              cves: [.[].cve],
+              severities: [.[].severity] | unique,
+              titles: [.[].title]
+            }) |
+            .[]
+          ' trivy-vuln.json > fixable-packages.jsonl 2>/dev/null || true
+
+          if [ ! -s fixable-packages.jsonl ]; then
+            echo "No fixable packages found."
+            exit 0
+          fi
+
+          CREATED_PRS=""
+
+          while IFS= read -r pkg_json; do
+            PKG=$(echo "$pkg_json" | jq -r '.pkg')
+            INSTALLED=$(echo "$pkg_json" | jq -r '.installed')
+            FIXED=$(echo "$pkg_json" | jq -r '.fixed')
+            CVES=$(echo "$pkg_json" | jq -r '.cves | join(", ")')
+            SEVERITIES=$(echo "$pkg_json" | jq -r '.severities | join(", ")')
+
+            # Create a safe branch name from the package path
+            SAFE_PKG=$(echo "$PKG" | tr '/' '-' | tr '.' '-')
+            FIX_BRANCH="security-fix/${SAFE_PKG}-${FIXED}"
+
+            echo ""
+            echo "══════════════════════════════════════════════════"
+            echo "📦 $PKG: $INSTALLED → $FIXED"
+            echo "   CVEs: $CVES"
+            echo "══════════════════════════════════════════════════"
+
+            # Skip if branch already exists (idempotent)
+            if git ls-remote --exit-code --heads origin "$FIX_BRANCH" > /dev/null 2>&1; then
+              echo "⏭️  Branch $FIX_BRANCH already exists — skipping."
+              continue
+            fi
+
+            # Create fix branch from PR branch
+            git checkout "$PR_BRANCH"
+            git checkout -b "$FIX_BRANCH"
+
+            # Bump the dependency
+            echo "Running: go get ${PKG}@v${FIXED}"
+            if go get "${PKG}@v${FIXED}" 2>&1; then
+              go mod tidy
+
+              # Check if there are actual changes
+              if git diff --quiet go.mod go.sum; then
+                echo "⏭️  No changes in go.mod/go.sum — skipping."
+                git checkout "$PR_BRANCH"
+                git branch -D "$FIX_BRANCH"
+                continue
+              fi
+
+              git add go.mod go.sum
+              COMMIT_MSG="fix(deps): bump ${PKG} ${INSTALLED} → ${FIXED}"
+              COMMIT_MSG="${COMMIT_MSG}
+
+              Fixes: ${CVES}
+              Severity: ${SEVERITIES}
+
+              Auto-generated by Trivy security scan."
+              git commit -m "$COMMIT_MSG"
+
+              git push origin "$FIX_BRANCH"
+
+              # Build PR body
+              PR_BODY="## 🔒 Security Fix: \`${PKG}\`
+
+              | Field | Value |
+              |-------|-------|
+              | **Package** | \`${PKG}\` |
+              | **Current version** | \`${INSTALLED}\` |
+              | **Fixed version** | \`${FIXED}\` |
+              | **CVE(s)** | ${CVES} |
+              | **Severity** | ${SEVERITIES} |
+
+              ### What changed
+              Bumped \`${PKG}\` from \`${INSTALLED}\` to \`${FIXED}\` to resolve known vulnerabilities.
+
+              ### How to verify
+              - [ ] CI passes (tests, build)
+              - [ ] No breaking API changes in the new version
+
+              ---
+              *🤖 Auto-generated by the Trivy security scan workflow.*"
+
+              gh pr create \
+                --title "🔒 fix(deps): bump ${PKG} to ${FIXED}" \
+                --body "$PR_BODY" \
+                --base "$PR_BRANCH" \
+                --head "$FIX_BRANCH"
+
+              CREATED_PRS="${CREATED_PRS}\n- \`${PKG}\` ${INSTALLED} → ${FIXED} (${CVES})"
+              echo "✅ Created fix PR for $PKG"
+            else
+              echo "⚠️ Failed to bump ${PKG} — skipping."
+              git checkout "$PR_BRANCH"
+              git branch -D "$FIX_BRANCH" 2>/dev/null || true
+            fi
+
+          done < fixable-packages.jsonl
+
+          if [ -n "$CREATED_PRS" ]; then
+            echo ""
+            echo "═══════════════════════════════════════"
+            echo "📋 Summary of created fix PRs:"
+            echo -e "$CREATED_PRS"
+          else
+            echo "No fix PRs were created."
+          fi
